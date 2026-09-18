@@ -23,7 +23,21 @@ SC_URL_PATTERN = re.compile(
 def extract_soundcloud_url(text: str) -> Optional[str]:
     """Извлекает ссылку SoundCloud из текста сообщения."""
     match = SC_URL_PATTERN.search(text)
-    return match.group(0) if match else None
+    if not match:
+        return None
+    url = match.group(0)
+    # Разыменовываем мобильные короткие ссылки on.soundcloud.com
+    if "on.soundcloud.com" in url:
+        try:
+            resp = requests.get(url, allow_redirects=False, timeout=10)
+            if resp.status_code in (301, 302, 303, 307, 308) and "Location" in resp.headers:
+                loc = resp.headers["Location"]
+                clean_url = loc.split("?")[0]
+                logger.info(f"Короткая ссылка {url} развернута в {clean_url}")
+                return clean_url
+        except Exception as e:
+            logger.warning(f"Не удалось развернуть короткую ссылку {url}: {e}")
+    return url
 
 
 def get_ffmpeg_path() -> Optional[str]:
@@ -60,7 +74,7 @@ class DownloadedTrack:
 def _download_track_sync(url: str, output_dir: Path) -> DownloadedTrack:
     """Синхронная функция скачивания через yt-dlp."""
     unique_id = uuid.uuid4().hex[:10]
-    out_template = str(output_dir / f"{unique_id}_%(title).100s.%(ext)s")
+    out_template = str(output_dir / f"{unique_id}.%(ext)s")
     ffmpeg_exe = get_ffmpeg_path()
 
     ydl_opts = {
@@ -68,6 +82,7 @@ def _download_track_sync(url: str, output_dir: Path) -> DownloadedTrack:
         'outtmpl': out_template,
         'quiet': True,
         'no_warnings': True,
+        'windowsfilenames': True,
         'postprocessors': [
             {
                 'key': 'FFmpegExtractAudio',
@@ -103,23 +118,15 @@ def _download_track_sync(url: str, output_dir: Path) -> DownloadedTrack:
         thumbnail_url = info.get('thumbnail')
 
         # Определяем итоговый путь к MP3-файлу
-        # yt-dlp после постпроцессинга меняет расширение на .mp3
-        expected_filename = ydl.prepare_filename(info)
-        base_path = Path(expected_filename)
-        mp3_path = base_path.with_suffix('.mp3')
-
-        # Если файл с .mp3 не найден, ищем файл с префиксом unique_id в output_dir
+        mp3_path = output_dir / f"{unique_id}.mp3"
         if not mp3_path.exists():
-            matched_files = list(output_dir.glob(f"{unique_id}_*.mp3"))
-            if matched_files:
-                mp3_path = matched_files[0]
+            matched_files = list(output_dir.glob(f"{unique_id}.*"))
+            # Исключаем файлы фрагментов и ytdl
+            valid_files = [f for f in matched_files if not f.name.endswith(('.part', '.ytdl'))]
+            if valid_files:
+                mp3_path = valid_files[0]
             else:
-                # Возможно, расширение осталось исходным (m4a, opus, etc.)
-                matched_files = list(output_dir.glob(f"{unique_id}_*.*"))
-                if matched_files:
-                    mp3_path = matched_files[0]
-                else:
-                    raise FileNotFoundError("Не удалось найти скачанный аудиофайл.")
+                raise FileNotFoundError("Не удалось найти скачанный аудиофайл.")
 
         file_size = mp3_path.stat().st_size
         if file_size > MAX_FILE_SIZE_BYTES:
